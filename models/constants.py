@@ -8,3 +8,11 @@ VALID_POSITIONAL_EMBEDDING_TYPES = [
     'learnable-fourier', 'multi-learnable-fourier',
     'custom-rotational', 'custom-rotational-1d'
 ]
+
+VALID_BIO_MECHANISMS = [
+    'short_term_plasticity',
+    'homeostasis', 
+    'lateral_inhibition',
+    'refractory',
+    'synaptic_noise'
+]
