@@ -194,7 +194,7 @@ def main():
     if args.experiment_name is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         bio_str = 'bio' if args.use_bio else 'baseline'
-        args.experiment_name = f'{args.task}_{bio_str}_{timestamp}'
+        args.experiment_name = f'{args.task}_{args.seed}_{bio_str}_{timestamp}'
     
     output_dir = os.path.join(args.output_dir, args.experiment_name)
     os.makedirs(output_dir, exist_ok=True)

@@ -6,7 +6,6 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import argparse
 
-
 def load_results(output_dir):
     """Load all experiment results from output directory."""
     results = {}
@@ -116,8 +115,10 @@ def print_summary_table(summary):
 
 
 def main():
+    results_path = 'outputs/bio_ablation'
+    os.makedirs(results_path, exist_ok=True)
     parser = argparse.ArgumentParser()
-    parser.add_argument('--output_dir', type=str, default='outputs/bio_ablation')
+    parser.add_argument('--output_dir', type=str, default=results_path)
     args = parser.parse_args()
     
     results = load_results(args.output_dir)
