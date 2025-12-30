@@ -1,31 +1,23 @@
-# models/ctm_hebbian.py
+# models/ctm_bio_hebbian.py
+"""
+HebbianCTM: Extends BioInspiredCTM with Hebbian plastic synapses.
+"""
 import torch
 import torch.nn as nn
 import numpy as np
 import math
 
-from models.ctm import ContinuousThoughtMachine
-from models.bio_modules import (
-    ShortTermPlasticity,
-    HomeostaticRegulation, 
-    LateralInhibition,
-    RefractoryDynamics,
-    SynapticNoise
-)
-from models.hebbian_modules import HebbianPlasticity, HebbianSynapseModel
+from models.ctm_bio import BioInspiredCTM
+from models.bio_hebbian_modules import HebbianPlasticity, HebbianSynapseModel
 
 
-class HebbianCTM(ContinuousThoughtMachine):
+class HebbianCTM(BioInspiredCTM):
     """
     CTM with Hebbian meta-learning for synapse weights.
     
-    Key innovation: Synapse weights are not fixed after training.
-    Instead, we learn the RULES for how weights should update,
-    and weights self-organize during the internal tick loop.
-    
-    This combines:
-    - Your working bio mechanisms (refractory, lateral inhibition)
-    - Hebbian weight plasticity from Najarro & Risi
+    Uses HYBRID approach: static synapses (backbone) + Hebbian modulation.
+    This provides stability from the static path while allowing Hebbian
+    plasticity to learn adaptive refinements.
     """
     
     def __init__(
@@ -33,110 +25,66 @@ class HebbianCTM(ContinuousThoughtMachine):
         # Hebbian plasticity settings
         use_hebbian_synapses: bool = True,
         hebbian_init_scale: float = 0.01,
-        hebbian_weight_decay: float = 0.001,
+        hebbian_weight_decay: float = 0.01,  # Increased from 0.001
         n_plastic_layers: int = 2,
-        
-        # Bio-inspired flags (your existing mechanisms)
-        use_lateral_inhibition: bool = True,
-        use_refractory: bool = True,
-        use_synaptic_noise: bool = False,
-        
-        # Bio parameters
-        inhibition_strength: float = 0.1,
-        inhibition_neighborhood: int = 8,
-        refractory_strength: float = 0.3,
-        refractory_decay: float = 0.8,
-        noise_scale: float = 0.01,
-        
-        # Standard CTM parameters
-        **ctm_kwargs
+        hebbian_modulation_scale: float = 0.1,  # How much Hebbian contributes
+        **kwargs
     ):
-        # Don't call super().__init__() yet - we need to override synapse creation
-        nn.Module.__init__(self)
+        # Store Hebbian settings before calling super().__init__
+        self._use_hebbian_synapses = use_hebbian_synapses
+        self._hebbian_init_scale = hebbian_init_scale
+        self._hebbian_weight_decay = hebbian_weight_decay
+        self._n_plastic_layers = n_plastic_layers
         
-        # Store all parameters
-        self.use_hebbian_synapses = use_hebbian_synapses
-        self.use_lateral_inhibition = use_lateral_inhibition
-        self.use_refractory = use_refractory
-        self.use_synaptic_noise = use_synaptic_noise
+        # Call parent init (BioInspiredCTM -> ContinuousThoughtMachine)
+        # NOTE: Do NOT delete self.synapses - we use it as backbone!
+        super().__init__(**kwargs)
         
-        # Store CTM kwargs for later
-        self.iterations = ctm_kwargs['iterations']
-        self.d_model = ctm_kwargs['d_model']
-        self.d_input = ctm_kwargs['d_input']
-        self.memory_length = ctm_kwargs['memory_length']
-        self.prediction_reshaper = ctm_kwargs.get('prediction_reshaper', [-1])
-        self.n_synch_out = ctm_kwargs['n_synch_out']
-        self.n_synch_action = ctm_kwargs['n_synch_action']
-        self.backbone_type = ctm_kwargs['backbone_type']
-        self.out_dims = ctm_kwargs['out_dims']
-        self.positional_embedding_type = ctm_kwargs['positional_embedding_type']
-        self.neuron_select_type = ctm_kwargs.get('neuron_select_type', 'random-pairing')
-        
-        # Verify args
-        self._verify_args(ctm_kwargs)
-        
-        # Setup input processing (same as base CTM)
-        self._setup_input_processing(ctm_kwargs)
-        
-        # Setup EITHER Hebbian OR static synapses
+        # Add Hebbian module as modulation (not replacement)
         if use_hebbian_synapses:
-            self.synapses = HebbianSynapseModel(
+            self.hebbian_synapses = HebbianSynapseModel(
                 d_model=self.d_model,
                 d_input=self.d_input,
                 n_plastic_layers=n_plastic_layers,
                 init_scale=hebbian_init_scale,
                 weight_decay=hebbian_weight_decay,
             )
-        else:
-            self.synapses = self._get_static_synapses(
-                ctm_kwargs['synapse_depth'],
-                self.d_model,
-                ctm_kwargs.get('dropout', 0)
-            )
-        
-        # Setup NLMs (same as base CTM)
-        self._setup_nlms(ctm_kwargs)
-        
-        # Setup synchronization (same as base CTM)
-        self._setup_synchronization(ctm_kwargs)
-        
-        # Setup bio mechanisms
-        if use_lateral_inhibition:
-            self.lateral_inhibition = LateralInhibition(
-                self.d_model, inhibition_strength, inhibition_neighborhood
-            )
-        
-        if use_refractory:
-            self.refractory = RefractoryDynamics(
-                self.d_model, refractory_strength, refractory_decay
-            )
-        
-        if use_synaptic_noise:
-            self.synaptic_noise = SynapticNoise(self.d_model, noise_scale)
-        
-        # Output projector
-        self.output_projector = nn.Sequential(nn.LazyLinear(self.out_dims))
-
+            
+            # Learnable gate for Hebbian contribution (starts small)
+            self.hebbian_gate = nn.Parameter(torch.tensor(hebbian_modulation_scale))
+            
+            # Layer norm to stabilize Hebbian output
+            self.hebbian_norm = nn.LayerNorm(self.d_model)
+    
     def _init_hebbian_states(self, batch_size: int, device: torch.device):
-        """Initialize Hebbian plastic weights and activation history."""
-        states = {}
-        
-        if self.use_hebbian_synapses:
-            states['plastic_weights'] = self.synapses.init_plastic_weights(batch_size, device)
-            states['prev_activations'] = None  # Will be set after first tick
-        
-        if self.use_refractory:
-            states['refractory'] = torch.zeros(batch_size, self.d_model, device=device)
-        
-        return states
+        """Initialize Hebbian plastic weights."""
+        if self._use_hebbian_synapses:
+            return {
+                'plastic_weights': self.hebbian_synapses.init_plastic_weights(batch_size, device),
+                'prev_activations': None,
+            }
+        return {}
 
     def forward(self, x, track=False):
         B = x.size(0)
         device = x.device
 
         # --- Tracking Initialization ---
-        tracking = self._init_tracking() if track else None
+        pre_activations_tracking = []
+        post_activations_tracking = []
+        synch_out_tracking = []
+        synch_action_tracking = []
+        attention_tracking = []
+        
+        # Bio-inspired tracking
+        bio_tracking = {
+            'facilitation': [],
+            'depression': [],
+            'running_rates': [],
+            'refractory': [],
+            'plastic_weights': [],
+            'hebbian_contribution': [],  # Track how much Hebbian adds
+        }
 
         # --- Featurise Input Data ---
         kv = self.compute_features(x)
@@ -145,27 +93,31 @@ class HebbianCTM(ContinuousThoughtMachine):
         state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1)
         activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1)
 
-        # --- Initialize Hebbian + Bio States ---
+        # --- Initialize Bio States (from parent) ---
+        bio_states = self._init_bio_states(B, device)
+        
+        # --- Initialize Hebbian States ---
         hebbian_states = self._init_hebbian_states(B, device)
 
-        # --- Prepare Storage for Outputs ---
+        # --- Prepare Storage for Outputs per Iteration ---
         predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
         certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
 
-        # --- Initialise Synchronization ---
+        # --- Initialise Recurrent Synch Values ---
         decay_alpha_action, decay_beta_action = None, None
         self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)
         self.decay_params_out.data = torch.clamp(self.decay_params_out, 0, 15)
         r_action = torch.exp(-self.decay_params_action).unsqueeze(0).repeat(B, 1)
         r_out = torch.exp(-self.decay_params_out).unsqueeze(0).repeat(B, 1)
+
         _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(
             activated_state, None, None, r_out, synch_type='out'
         )
 
         # --- Recurrent Loop ---
         for stepi in range(self.iterations):
-            
-            # --- Calculate Synchronisation for Action ---
+
+            # --- Calculate Synchronisation for Input Data Interaction ---
             synchronisation_action, decay_alpha_action, decay_beta_action = \
                 self.compute_synchronisation(
                     activated_state, decay_alpha_action, decay_beta_action, 
@@ -178,19 +130,45 @@ class HebbianCTM(ContinuousThoughtMachine):
                 q, kv, kv, average_attn_weights=False, need_weights=True
             )
             attn_out = attn_out.squeeze(1)
-            pre_synapse_input = torch.cat((attn_out, activated_state), dim=-1)
+            pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1)
 
-            # --- Apply Synapses (Hebbian or Static) ---
-            if self.use_hebbian_synapses:
-                state, new_plastic_weights, activations = self.synapses(
+            # --- Apply Synapses: HYBRID (Static backbone + Hebbian modulation) ---
+            # Static backbone - always provides stable gradient path
+            state = self.synapses(pre_synapse_input)
+            
+            # Hebbian modulation - adaptive refinement
+            if self._use_hebbian_synapses:
+                hebbian_out, new_plastic_weights, activations = self.hebbian_synapses(
                     pre_synapse_input,
                     hebbian_states['plastic_weights'],
                     hebbian_states['prev_activations']
                 )
                 hebbian_states['plastic_weights'] = new_plastic_weights
                 hebbian_states['prev_activations'] = activations
-            else:
-                state = self.synapses(pre_synapse_input)
+                
+                # Normalize and bound Hebbian contribution
+                hebbian_out = self.hebbian_norm(hebbian_out)
+                hebbian_contribution = torch.sigmoid(self.hebbian_gate) * torch.tanh(hebbian_out)
+                
+                # Combine: static + bounded Hebbian
+                state = state + hebbian_contribution
+                
+                # Track contribution magnitude
+                if track:
+                    bio_tracking['hebbian_contribution'].append(
+                        hebbian_contribution.abs().mean().item()
+                    )
+            
+            # --- Bio: Short-Term Plasticity (modulates synapse output) ---
+            if self.use_short_term_plasticity:
+                modulation, bio_states['facilitation'], bio_states['depression'] = \
+                    self.stp(
+                        pre_synapse_input[:, :self.d_model],
+                        state,
+                        bio_states['facilitation'],
+                        bio_states['depression']
+                    )
+                state = state * modulation
             
             # Update trace
             state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
@@ -198,20 +176,25 @@ class HebbianCTM(ContinuousThoughtMachine):
             # --- Apply Neuron-Level Models ---
             activated_state = self.trace_processor(state_trace)
             
+            # --- Bio: Homeostatic Regulation ---
+            if self.use_homeostasis:
+                activated_state, bio_states['running_rates'] = \
+                    self.homeostasis(activated_state, bio_states['running_rates'])
+            
             # --- Bio: Lateral Inhibition ---
             if self.use_lateral_inhibition:
                 activated_state = self.lateral_inhibition(activated_state)
             
             # --- Bio: Refractory Dynamics ---
             if self.use_refractory:
-                activated_state, hebbian_states['refractory'] = \
-                    self.refractory(activated_state, hebbian_states['refractory'])
+                activated_state, bio_states['refractory'] = \
+                    self.refractory(activated_state, bio_states['refractory'])
             
             # --- Bio: Synaptic Noise ---
             if self.use_synaptic_noise:
                 activated_state = self.synaptic_noise(activated_state, self.training)
 
-            # --- Calculate Output Synchronisation ---
+            # --- Calculate Synchronisation for Output Predictions ---
             synchronisation_out, decay_alpha_out, decay_beta_out = \
                 self.compute_synchronisation(
                     activated_state, decay_alpha_out, decay_beta_out, 
@@ -227,10 +210,42 @@ class HebbianCTM(ContinuousThoughtMachine):
 
             # --- Tracking ---
             if track:
-                self._update_tracking(tracking, state_trace, activated_state, 
-                                     attn_weights, synchronisation_out, 
-                                     synchronisation_action, hebbian_states)
+                pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
+                post_activations_tracking.append(activated_state.detach().cpu().numpy())
+                attention_tracking.append(attn_weights.detach().cpu().numpy())
+                synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
+                synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
+                
+                # Bio tracking
+                if self.use_short_term_plasticity:
+                    bio_tracking['facilitation'].append(
+                        bio_states['facilitation'].detach().cpu().numpy()
+                    )
+                    bio_tracking['depression'].append(
+                        bio_states['depression'].detach().cpu().numpy()
+                    )
+                if self.use_homeostasis:
+                    bio_tracking['running_rates'].append(
+                        bio_states['running_rates'].detach().cpu().numpy()
+                    )
+                if self.use_refractory:
+                    bio_tracking['refractory'].append(
+                        bio_states['refractory'].detach().cpu().numpy()
+                    )
+                # Hebbian tracking
+                if self._use_hebbian_synapses:
+                    weight_stats = [w.abs().mean().item() for w in hebbian_states['plastic_weights']]
+                    bio_tracking['plastic_weights'].append(weight_stats)
 
+        # --- Return Values ---
         if track:
-            return self._format_tracking_output(predictions, certainties, tracking)
+            return (
+                predictions, 
+                certainties, 
+                (np.array(synch_out_tracking), np.array(synch_action_tracking)), 
+                np.array(pre_activations_tracking), 
+                np.array(post_activations_tracking), 
+                np.array(attention_tracking),
+                bio_tracking
+            )
         return predictions, certainties, synchronisation_out

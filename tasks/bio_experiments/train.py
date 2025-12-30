@@ -11,6 +11,7 @@ from datetime import datetime
 
 from models.ctm_bio import BioInspiredCTM
 from models.ctm import ContinuousThoughtMachine
+from models.ctm_bio_hebbian import HebbianCTM  
 from data.custom_datasets import ParityDataset
 from utils.losses import parity_loss
 from utils.housekeeping import set_seed
@@ -54,6 +55,12 @@ def get_args():
     parser.add_argument('--use_refractory', action='store_true')
     parser.add_argument('--use_synaptic_noise', action='store_true')
     
+    # ADD HEBBIAN FLAGS
+    parser.add_argument('--use_hebbian', action='store_true', help='Use Hebbian CTM with plastic synapses')
+    parser.add_argument('--hebbian_init_scale', type=float, default=0.01)
+    parser.add_argument('--hebbian_weight_decay', type=float, default=0.001)
+    parser.add_argument('--n_plastic_layers', type=int, default=2)
+    
     # Bio-inspired hyperparameters
     parser.add_argument('--tau_facilitate', type=float, default=5.0)
     parser.add_argument('--tau_depress', type=float, default=20.0)
@@ -69,7 +76,7 @@ def get_args():
 
 
 def build_model(args):
-    """Build either baseline CTM or Bio-Inspired CTM based on args."""
+    """Build either baseline CTM, Bio-Inspired CTM, or Hebbian CTM based on args."""
     
     ctm_kwargs = dict(
         iterations=args.iterations,
@@ -92,7 +99,26 @@ def build_model(args):
         n_random_pairing_self=0,
     )
     
-    if args.use_bio:
+    # ADD HEBBIAN BRANCH (check first since it's most specific)
+    if args.use_hebbian:
+        model = HebbianCTM(
+            # Hebbian settings
+            use_hebbian_synapses=True,
+            hebbian_init_scale=args.hebbian_init_scale,
+            hebbian_weight_decay=args.hebbian_weight_decay,
+            n_plastic_layers=args.n_plastic_layers,
+            # Bio settings (can combine with Hebbian)
+            use_lateral_inhibition=args.use_lateral_inhibition,
+            use_refractory=args.use_refractory,
+            use_synaptic_noise=args.use_synaptic_noise,
+            inhibition_strength=args.inhibition_strength,
+            inhibition_neighborhood=args.inhibition_neighborhood,
+            refractory_strength=args.refractory_strength,
+            refractory_decay=args.refractory_decay,
+            noise_scale=args.noise_scale,
+            **ctm_kwargs
+        )
+    elif args.use_bio:
         model = BioInspiredCTM(
             use_short_term_plasticity=args.use_short_term_plasticity,
             use_homeostasis=args.use_homeostasis,
@@ -193,7 +219,13 @@ def main():
     # Setup output directory
     if args.experiment_name is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        bio_str = 'bio' if args.use_bio else 'baseline'
+        # UPDATE: include hebbian in naming
+        if args.use_hebbian:
+            bio_str = 'hebbian'
+        elif args.use_bio:
+            bio_str = 'bio'
+        else:
+            bio_str = 'baseline'
         args.experiment_name = f'{args.task}_{args.seed}_{bio_str}_{timestamp}'
     
     output_dir = os.path.join(args.output_dir, args.experiment_name)
